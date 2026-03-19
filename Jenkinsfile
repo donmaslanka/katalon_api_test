@@ -105,7 +105,7 @@ pipeline {
                     aws ecs describe-task-definition \
                       --region "$AWS_REGION" \
                       --task-definition "$ECS_TASK_DEFINITION" \
-                      --query 'taskDefinition.containerDefinitions[0].logConfiguration.options.awslogs-group' \
+                      --query 'taskDefinition.containerDefinitions[0].logConfiguration.options."awslogs-group"' \
                       --output text
                 '''
             }
