@@ -1,0 +1,176 @@
+provider "aws" {
+  region = "us-west-2"
+}
+
+# 1. DATA SOURCES (To find S3 automatically)
+data "aws_prefix_list" "s3" {
+  name = "com.amazonaws.us-west-2.s3"
+}
+
+# 2. ECR & S3 
+resource "aws_ecr_repository" "katalon_repo" {
+  name                 = "katalon-test-runner"
+  image_tag_mutability = "MUTABLE"
+  force_delete         = true
+}
+
+resource "aws_s3_bucket" "reports" {
+  bucket = "katalon-reports-318798562215"
+}
+
+# 3. ECS INFRASTRUCTURE
+resource "aws_ecs_cluster" "katalon_cluster" {
+  name = "katalon-testing-cluster"
+}
+
+# 4. IAM ROLES (Refreshed for clean state)
+resource "aws_iam_role" "ecs_execution_role" {
+  name = "katalon-execution-role-v4"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Action = "sts:AssumeRole", Effect = "Allow", Principal = { Service = "ecs-tasks.amazonaws.com" } }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_execution_std" {
+  role       = aws_iam_role.ecs_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_iam_role" "ecs_task_role" {
+  name = "katalon-task-role-v4"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Action = "sts:AssumeRole", Effect = "Allow", Principal = { Service = "ecs-tasks.amazonaws.com" } }]
+  })
+}
+
+resource "aws_iam_role_policy" "s3_write" {
+  name = "KatalonS3Write"
+  role = aws_iam_role.ecs_task_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:PutObject", "s3:ListBucket"]
+      Resource = ["${aws_s3_bucket.reports.arn}", "${aws_s3_bucket.reports.arn}/*"]
+    }]
+  })
+}
+
+# 5. TASK DEFINITION
+resource "aws_ecs_task_definition" "katalon" {
+  family                   = "katalon-runner"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = "1024"
+  memory                   = "2048"
+  execution_role_arn       = aws_iam_role.ecs_execution_role.arn
+  task_role_arn            = aws_iam_role.ecs_task_role.arn
+
+  container_definitions = jsonencode([{
+    name      = "katalon-container"
+    image     = "${aws_ecr_repository.katalon_repo.repository_url}:${var.katalon_image_tag}"
+    essential = true
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = "/ecs/katalon-tests"
+        "awslogs-region"        = "us-west-2"
+        "awslogs-stream-prefix" = "ecs"
+        "awslogs-create-group"  = "true"
+      }
+    }
+  }])
+}
+
+# 6. THE "AIRTIGHT" SECURITY GROUP
+resource "aws_security_group" "ecs_sg_v4" {
+  name        = "katalon-task-sg-v4"
+  vpc_id      = "vpc-03e31e80fc435c709"
+  description = "Airtight Fargate SG with DNS and S3 support"
+}
+
+# Outbound Rule: DNS (UDP 53) - The Missing Link
+resource "aws_security_group_rule" "v4_dns_udp" {
+  type              = "egress"
+  from_port         = 53
+  to_port           = 53
+  protocol          = "udp"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.ecs_sg_v4.id
+}
+
+# Outbound Rule: S3 Gateway (Port 443) - The Image Data Pull
+resource "aws_security_group_rule" "v4_s3_egress" {
+  type              = "egress"
+  from_port         = 443
+  to_port           = 443
+  protocol          = "tcp"
+  prefix_list_ids   = [data.aws_prefix_list.s3.id]
+  security_group_id = aws_security_group.ecs_sg_v4.id
+}
+
+# Outbound Rule: General Egress (Optional but helpful)
+resource "aws_security_group_rule" "v4_all_egress" {
+  type              = "egress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.ecs_sg_v4.id
+}
+
+# Inbound Rule: Self-Referencing for Endpoints
+resource "aws_security_group_rule" "v4_ingress_443_self" {
+  type              = "ingress"
+  from_port         = 443
+  to_port           = 443
+  protocol          = "tcp"
+  self              = true
+  security_group_id = aws_security_group.ecs_sg_v4.id
+}
+
+# 7. VPC ENDPOINTS (With Private DNS Forced ON)
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = "vpc-03e31e80fc435c709"
+  service_name      = "com.amazonaws.us-west-2.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = ["rtb-0655dedb5f3dcc0ef"]
+}
+
+resource "aws_vpc_endpoint" "ecr_api" {
+  vpc_id              = "vpc-03e31e80fc435c709"
+  service_name        = "com.amazonaws.us-west-2.ecr.api"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = ["subnet-0dccc447d13149fda"]
+  security_group_ids  = [aws_security_group.ecs_sg_v4.id]
+}
+
+resource "aws_vpc_endpoint" "ecr_dkr" {
+  vpc_id              = "vpc-03e31e80fc435c709"
+  service_name        = "com.amazonaws.us-west-2.ecr.dkr"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = ["subnet-0dccc447d13149fda"]
+  security_group_ids  = [aws_security_group.ecs_sg_v4.id]
+}
+
+resource "aws_vpc_endpoint" "logs" {
+  vpc_id              = "vpc-03e31e80fc435c709"
+  service_name        = "com.amazonaws.us-west-2.logs"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = ["subnet-0dccc447d13149fda"]
+  security_group_ids  = [aws_security_group.ecs_sg_v4.id]
+}
+
+variable "katalon_image_tag" {
+  type        = string
+  description = "ECR image tag for katalon-test-runner"
+}
+
+output "final_sg_id" {
+  value = aws_security_group.ecs_sg_v4.id
+}

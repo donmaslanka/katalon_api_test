@@ -1,0 +1,54 @@
+# AWS Configuration
+aws_region     = "us-east-1"
+aws_account_id = "318798562215"
+
+# Project Configuration
+project_name = "katalon-testing"
+environment  = "dev"
+
+# VPC Configuration
+vpc_cidr             = "10.0.0.0/16"
+availability_zones   = ["us-east-1a", "us-east-1b"]
+public_subnet_cidrs  = ["10.0.1.0/24", "10.0.2.0/24"]
+private_subnet_cidrs = ["10.0.10.0/24", "10.0.11.0/24"]
+
+# Jenkins Configuration
+
+## OPTION A: Use Existing Jenkins Server
+# If you have an existing Jenkins EC2 instance, set this to its private IP
+# jenkins_server_ip = "10.0.5.100/32"  # Only needed for existing Jenkins
+# create_jenkins_server = false
+
+## OPTION B: Create New Jenkins Server from AMI (Recommended)
+create_jenkins_server = true
+
+# Jenkins AMI (client's Jenkins image)
+jenkins_ami_id = "ami-0a0403dde084aadfc"
+
+# OR use name filter to find AMI automatically
+# jenkins_ami_name_filter = "jenkins-*"
+
+# Instance Configuration
+jenkins_instance_type = "t3.medium"
+jenkins_key_name      = ""  # REQUIRED: Your SSH key pair name (e.g., "my-keypair")
+
+# Jenkins Network Security (IMPORTANT: Restrict these in production!)
+# Replace with your actual office/VPN IP addresses
+jenkins_ssh_allowed_cidrs = ["0.0.0.0/0"]  # TODO: Change to your IP (e.g., ["203.0.113.0/24"])
+jenkins_web_allowed_cidrs = ["0.0.0.0/0"]  # TODO: Change to your IP (e.g., ["203.0.113.0/24"])
+
+# Jenkins Storage
+jenkins_root_volume_size    = 50
+jenkins_create_data_volume  = false
+jenkins_data_volume_size    = 100
+
+# Jenkins Features
+jenkins_allocate_elastic_ip      = true   # Provides stable IP address
+jenkins_enable_cloudwatch_logs   = true
+jenkins_enable_cloudwatch_alarms = true
+
+# Katalon Configuration
+katalon_image         = "katalonstudio/katalon:latest"
+katalon_cpu           = 2048  # 2 vCPU
+katalon_memory        = 4096  # 4 GB
+katalon_desired_count = 0     # Set to 0 for on-demand execution only

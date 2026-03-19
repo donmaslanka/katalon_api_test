@@ -1,0 +1,43 @@
+{
+  "containerDefinitions": [
+    {
+      "name": "jenkins-agent",
+      "image": "318798562215.dkr.ecr.us-west-2.amazonaws.com/katalon-test-runner:tlsfix-20260109-01",
+      "cpu": 0,
+      "portMappings": [],
+      "essential": true,
+      "environment": [
+        {
+          "name": "JENKINS_AGENT_WORKDIR",
+          "value": "/workspace"
+        }
+      ],
+      "mountPoints": [],
+      "volumesFrom": [],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/jenkins/kre",
+          "awslogs-region": "us-west-2",
+          "awslogs-stream-prefix": "agent"
+        }
+      },
+      "systemControls": []
+    }
+  ],
+  "family": "jenkins-kre-agent",
+  "taskRoleArn": "arn:aws:iam::318798562215:role/jenkins-kre-task-role",
+  "executionRoleArn": "arn:aws:iam::318798562215:role/ecsTaskExecutionRole",
+  "networkMode": "awsvpc",
+  "volumes": [],
+  "placementConstraints": [],
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "1024",
+  "memory": "2048"
+}
