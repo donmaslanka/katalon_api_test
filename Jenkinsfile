@@ -12,7 +12,7 @@ pipeline {
         string(
             name: 'TEST_SUITE',
             defaultValue: 'Test Suites/Smoke',
-            description: 'Katalon test suite path, for example Test Suites/Smoke or just Smoke'
+            description: 'Katalon test suite path'
         )
         string(
             name: 'KATALON_PROJECT_PATH',
@@ -21,18 +21,18 @@ pipeline {
         )
         string(
             name: 'SUBNET_IDS',
-            defaultValue: 'subnet-aaaaaaaa,subnet-bbbbbbbb',
+            defaultValue: 'subnet-0968b2a4486c2c297',
             description: 'Comma-separated subnet IDs for Fargate task networking'
         )
         string(
             name: 'SECURITY_GROUP_IDS',
-            defaultValue: 'sg-aaaaaaaaaaaaaaaaa',
+            defaultValue: 'sg-014254f1dc8168a1a',
             description: 'Comma-separated security group IDs for the Fargate task'
         )
         choice(
             name: 'ASSIGN_PUBLIC_IP',
             choices: ['DISABLED', 'ENABLED'],
-            description: 'Usually DISABLED for private subnets, ENABLED for public subnets'
+            description: 'Usually DISABLED for private subnets'
         )
     }
 
@@ -58,7 +58,6 @@ pipeline {
                     if (!env.NORMALIZED_TEST_SUITE) {
                         env.NORMALIZED_TEST_SUITE = 'Test Suites/Smoke'
                     }
-
                     if (!env.NORMALIZED_TEST_SUITE.startsWith('Test Suites/')) {
                         env.NORMALIZED_TEST_SUITE =
                             "Test Suites/${env.NORMALIZED_TEST_SUITE}"
@@ -67,11 +66,6 @@ pipeline {
                     echo "BUILD_TIMESTAMP=${env.BUILD_TIMESTAMP}"
                     echo "TEST_SUITE=${env.NORMALIZED_TEST_SUITE}"
                     echo "KATALON_PROJECT_PATH=${params.KATALON_PROJECT_PATH}"
-                    echo "AWS_REGION=${env.AWS_REGION}"
-                    echo "ECS_CLUSTER=${env.ECS_CLUSTER}"
-                    echo "ECS_TASK_DEFINITION=${env.ECS_TASK_DEFINITION}"
-                    echo "ECS_CONTAINER_NAME=${env.ECS_CONTAINER_NAME}"
-                    echo "CW_LOG_GROUP=${env.CW_LOG_GROUP}"
                     echo "SUBNET_IDS=${params.SUBNET_IDS}"
                     echo "SECURITY_GROUP_IDS=${params.SECURITY_GROUP_IDS}"
                     echo "ASSIGN_PUBLIC_IP=${params.ASSIGN_PUBLIC_IP}"
@@ -89,42 +83,6 @@ pipeline {
                     }
                     aws --version
                     aws sts get-caller-identity
-                '''
-            }
-        }
-
-        stage('Validate ECS Config') {
-            steps {
-                sh '''
-                    set -e
-
-                    echo "Checking ECS cluster..."
-                    aws ecs describe-clusters \
-                      --region "$AWS_REGION" \
-                      --clusters "$ECS_CLUSTER" \
-                      --query 'clusters[0].clusterName' \
-                      --output text
-
-                    echo "Checking task definition family..."
-                    aws ecs describe-task-definition \
-                      --region "$AWS_REGION" \
-                      --task-definition "$ECS_TASK_DEFINITION" \
-                      --query 'taskDefinition.family' \
-                      --output text
-
-                    echo "Container names in task definition:"
-                    aws ecs describe-task-definition \
-                      --region "$AWS_REGION" \
-                      --task-definition "$ECS_TASK_DEFINITION" \
-                      --query 'taskDefinition.containerDefinitions[].name' \
-                      --output text
-
-                    echo "CloudWatch log group from task definition:"
-                    aws ecs describe-task-definition \
-                      --region "$AWS_REGION" \
-                      --task-definition "$ECS_TASK_DEFINITION" \
-                      --query 'taskDefinition.containerDefinitions[0].logConfiguration.options."awslogs-group"' \
-                      --output text
                 '''
             }
         }
@@ -151,20 +109,22 @@ pipeline {
                         if (subnetList.isEmpty()) {
                             error('SUBNET_IDS cannot be empty')
                         }
-
                         if (securityGroupList.isEmpty()) {
                             error('SECURITY_GROUP_IDS cannot be empty')
                         }
 
+                        def cleanApiKey = env.KATALON_API_KEY?.trim()
+                            ?.replaceFirst(/^apiKey=/, '')
+
                         def commandList = [
-                            '-runMode=console',
+                            "-runMode=console",
                             "-projectPath=${params.KATALON_PROJECT_PATH}",
                             "-testSuitePath=${env.NORMALIZED_TEST_SUITE}",
-                            '-browserType=Chrome',
-                            "-apiKey=${env.KATALON_API_KEY}",
+                            "-browserType=Chrome",
+                            "-apiKey=${cleanApiKey}",
                             "-orgID=${env.KATALON_ORG_ID}",
-                            '-retry=0',
-                            '-statusDelay=15',
+                            "-retry=0",
+                            "-statusDelay=15",
                             "-buildLabel=jenkins-${env.BUILD_NUMBER}-${env.BUILD_TIMESTAMP}"
                         ]
 
@@ -183,19 +143,14 @@ pipeline {
                             ]
                         ]
 
-                        def overridesJson =
-                            groovy.json.JsonOutput.toJson(overridesMap)
-                        def networkConfigJson =
-                            groovy.json.JsonOutput.toJson(networkConfigMap)
-
-                        writeFile file: 'ecs-overrides.json', text: overridesJson
-                        writeFile file: 'ecs-network-config.json', text: networkConfigJson
-
-                        echo 'ECS container override JSON:'
-                        echo groovy.json.JsonOutput.prettyPrint(overridesJson)
-
-                        echo 'ECS network config JSON:'
-                        echo groovy.json.JsonOutput.prettyPrint(networkConfigJson)
+                        writeFile(
+                            file: 'ecs-overrides.json',
+                            text: groovy.json.JsonOutput.toJson(overridesMap)
+                        )
+                        writeFile(
+                            file: 'ecs-network-config.json',
+                            text: groovy.json.JsonOutput.toJson(networkConfigMap)
+                        )
 
                         def taskArn = sh(
                             script: """
@@ -214,16 +169,6 @@ pipeline {
                         ).trim()
 
                         if (!taskArn || taskArn == 'None' || taskArn == 'null') {
-                            sh """
-                                aws ecs run-task \
-                                  --region '${env.AWS_REGION}' \
-                                  --cluster '${env.ECS_CLUSTER}' \
-                                  --task-definition '${env.ECS_TASK_DEFINITION}' \
-                                  --launch-type FARGATE \
-                                  --count 1 \
-                                  --network-configuration file://ecs-network-config.json \
-                                  --overrides file://ecs-overrides.json
-                            """
                             error('Failed to start ECS task: no taskArn returned')
                         }
 
@@ -263,28 +208,14 @@ pipeline {
                             returnStdout: true
                         ).trim()
 
-                        def lastStatus = sh(
-                            script: """
-                                aws ecs describe-tasks \
-                                  --region '${env.AWS_REGION}' \
-                                  --cluster '${env.ECS_CLUSTER}' \
-                                  --tasks '${env.ECS_TASK_ARN}' \
-                                  --query "tasks[0].lastStatus" \
-                                  --output text
-                            """,
-                            returnStdout: true
-                        ).trim()
-
-                        echo "Task last status: ${lastStatus}"
                         echo "Task stopped reason: ${stopReason}"
                         echo "Container exit code: ${exitCode}"
-                        echo "CloudWatch log group: ${env.CW_LOG_GROUP}"
-                        echo "Expected log stream prefix: ecs/${env.ECS_CONTAINER_NAME}/${env.ECS_TASK_ID}"
 
                         if (exitCode != '0') {
                             error(
                                 "Katalon ECS task failed. " +
-                                "taskArn=${env.ECS_TASK_ARN}, exitCode=${exitCode}, " +
+                                "taskArn=${env.ECS_TASK_ARN}, " +
+                                "exitCode=${exitCode}, " +
                                 "stoppedReason=${stopReason}"
                             )
                         }
@@ -301,21 +232,10 @@ pipeline {
                     echo "Final ECS task ARN: ${env.ECS_TASK_ARN}"
                     echo "CloudWatch log group: ${env.CW_LOG_GROUP}"
                     echo "Look for log stream starting with: ecs/${env.ECS_CONTAINER_NAME}/${env.ECS_TASK_ID}"
-                } else {
-                    echo 'No ECS task ARN captured.'
                 }
             }
-
             archiveArtifacts artifacts: 'ecs-overrides.json,ecs-network-config.json', allowEmptyArchive: true
             cleanWs(deleteDirs: true, notFailBuild: true)
-        }
-
-        success {
-            echo 'Katalon ECS run completed successfully.'
-        }
-
-        failure {
-            echo 'Katalon ECS run failed. Review ECS task events and CloudWatch logs.'
         }
     }
 }
