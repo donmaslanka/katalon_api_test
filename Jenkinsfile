@@ -25,8 +25,9 @@ pipeline {
         AWS_REGION          = 'us-west-2'
         ECS_CLUSTER         = 'katalon-testing-cluster'
         ECS_TASK_DEFINITION = 'katalon-runner'
-        ECS_CONTAINER_NAME  = 'katalon'
+        ECS_CONTAINER_NAME  = 'katalon-container'
         KATALON_ORG_ID      = '2333388'
+        CW_LOG_GROUP        = '/ecs/katalon-tests'
     }
 
     stages {
@@ -44,7 +45,8 @@ pipeline {
                     }
 
                     if (!env.NORMALIZED_TEST_SUITE.startsWith('Test Suites/')) {
-                        env.NORMALIZED_TEST_SUITE = "Test Suites/${env.NORMALIZED_TEST_SUITE}"
+                        env.NORMALIZED_TEST_SUITE =
+                            "Test Suites/${env.NORMALIZED_TEST_SUITE}"
                     }
 
                     echo "BUILD_TIMESTAMP=${env.BUILD_TIMESTAMP}"
@@ -54,6 +56,7 @@ pipeline {
                     echo "ECS_CLUSTER=${env.ECS_CLUSTER}"
                     echo "ECS_TASK_DEFINITION=${env.ECS_TASK_DEFINITION}"
                     echo "ECS_CONTAINER_NAME=${env.ECS_CONTAINER_NAME}"
+                    echo "CW_LOG_GROUP=${env.CW_LOG_GROUP}"
                 }
             }
         }
@@ -84,18 +87,25 @@ pipeline {
                       --query 'clusters[0].clusterName' \
                       --output text
 
-                    echo "Checking task definition..."
+                    echo "Checking task definition family..."
                     aws ecs describe-task-definition \
                       --region "$AWS_REGION" \
                       --task-definition "$ECS_TASK_DEFINITION" \
                       --query 'taskDefinition.family' \
                       --output text
 
-                    echo "Checking container name in task definition..."
+                    echo "Container names in task definition:"
                     aws ecs describe-task-definition \
                       --region "$AWS_REGION" \
                       --task-definition "$ECS_TASK_DEFINITION" \
-                      --query "contains(taskDefinition.containerDefinitions[].name, \`$ECS_CONTAINER_NAME\`)" \
+                      --query 'taskDefinition.containerDefinitions[].name' \
+                      --output text
+
+                    echo "CloudWatch log group from task definition:"
+                    aws ecs describe-task-definition \
+                      --region "$AWS_REGION" \
+                      --task-definition "$ECS_TASK_DEFINITION" \
+                      --query 'taskDefinition.containerDefinitions[0].logConfiguration.options.awslogs-group' \
                       --output text
                 '''
             }
@@ -129,7 +139,8 @@ pipeline {
                             ]]
                         ]
 
-                        def overridesJson = groovy.json.JsonOutput.toJson(overridesMap)
+                        def overridesJson =
+                            groovy.json.JsonOutput.toJson(overridesMap)
                         writeFile file: 'ecs-overrides.json', text: overridesJson
 
                         echo 'ECS container override JSON:'
@@ -214,6 +225,8 @@ pipeline {
                         echo "Task last status: ${lastStatus}"
                         echo "Task stopped reason: ${stopReason}"
                         echo "Container exit code: ${exitCode}"
+                        echo "CloudWatch log group: ${env.CW_LOG_GROUP}"
+                        echo "Expected log stream prefix: ecs/${env.ECS_CONTAINER_NAME}/${env.ECS_TASK_ID}"
 
                         if (exitCode != '0') {
                             error(
@@ -233,7 +246,8 @@ pipeline {
             script {
                 if (env.ECS_TASK_ARN?.trim()) {
                     echo "Final ECS task ARN: ${env.ECS_TASK_ARN}"
-                    echo "Open ECS task ${env.ECS_TASK_ID} in AWS console and review container logs."
+                    echo "CloudWatch log group: ${env.CW_LOG_GROUP}"
+                    echo "Look for log stream starting with: ecs/${env.ECS_CONTAINER_NAME}/${env.ECS_TASK_ID}"
                 } else {
                     echo 'No ECS task ARN captured.'
                 }
