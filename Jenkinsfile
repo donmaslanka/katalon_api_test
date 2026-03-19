@@ -36,14 +36,14 @@ pipeline {
         )
     }
 
-    environment {
-        AWS_REGION          = 'us-west-2'
-        ECS_CLUSTER         = 'katalon-testing-cluster'
-        ECS_TASK_DEFINITION = 'katalon-runner'
-        ECS_CONTAINER_NAME  = 'katalon-container'
-        KATALON_ORG_ID      = '2333388'
-        CW_LOG_GROUP        = '/ecs/katalon-tests'
-    }
+   environment {
+    AWS_REGION          = 'us-west-2'
+    ECS_CLUSTER         = 'katalon-testing-dev-cluster'
+    ECS_TASK_DEFINITION = 'katalon-testing-dev-katalon'
+    ECS_CONTAINER_NAME  = 'katalon-container'
+    KATALON_ORG_ID      = '2333388'
+    CW_LOG_GROUP        = '/ecs/katalon-testing-dev-katalon'
+}
 
     stages {
         stage('Init') {
