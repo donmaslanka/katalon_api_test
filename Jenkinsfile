@@ -3,49 +3,34 @@ pipeline {
 
     options {
         timestamps()
-        ansiColor('xterm')
-        buildDiscarder(logRotator(numToKeepStr: '20'))
         disableConcurrentBuilds()
-        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
     }
 
     parameters {
         string(
             name: 'TEST_SUITE',
-            defaultValue: 'Smoke',
-            description: 'Katalon test suite name or path under Test Suites/'
+            defaultValue: 'Test Suites/Smoke',
+            description: 'Katalon test suite path, for example Test Suites/Smoke or just Smoke'
         )
         string(
-            name: 'TARGET_URL',
-            defaultValue: 'https://example.com',
-            description: 'Target website URL to test'
-        )
-        choice(
-            name: 'BROWSER',
-            choices: ['Chrome', 'Firefox', 'Edge'],
-            description: 'Browser to use for testing'
-        )
-        booleanParam(
-            name: 'WAIT_FOR_COMPLETION',
-            defaultValue: true,
-            description: 'Wait for ECS task to complete before finishing the build'
+            name: 'KATALON_PROJECT_PATH',
+            defaultValue: '/katalon/project',
+            description: 'Path to the Katalon project inside the ECS container'
         )
     }
 
     environment {
-        AWS_REGION        = 'us-west-2'
-        ECS_CLUSTER       = credentials('ecs-cluster-name')
-        TASK_DEFINITION   = credentials('ecs-task-definition')
-        SUBNETS           = credentials('ecs-subnets')
-        SECURITY_GROUP    = credentials('ecs-security-group')
-        S3_RESULTS_BUCKET = credentials('s3-results-bucket')
-        KATALON_ORG_ID    = '2333388'
-        PROJECT_PATH      = '/katalon/project'
-        CW_LOG_GROUP      = '/ecs/katalon-testing-dev-katalon'
+        AWS_REGION          = 'us-west-2'
+        ECS_CLUSTER         = 'katalon-testing-cluster'
+        ECS_TASK_DEFINITION = 'katalon-runner'
+        ECS_CONTAINER_NAME  = 'katalon'
+        KATALON_ORG_ID      = '2333388'
     }
 
     stages {
-        stage('Initialize') {
+        stage('Init') {
             steps {
                 script {
                     env.BUILD_TIMESTAMP = sh(
@@ -53,224 +38,217 @@ pipeline {
                         returnStdout: true
                     ).trim()
 
-                    env.TASK_ARN = ''
-                    env.TASK_ID = ''
+                    env.NORMALIZED_TEST_SUITE = params.TEST_SUITE?.trim()
+                    if (!env.NORMALIZED_TEST_SUITE) {
+                        env.NORMALIZED_TEST_SUITE = 'Test Suites/Smoke'
+                    }
 
-                    echo "Test Configuration:"
-                    echo "  Test Suite: ${params.TEST_SUITE}"
-                    echo "  Target URL: ${params.TARGET_URL}"
-                    echo "  Browser: ${params.BROWSER}"
-                    echo "  Build ID: ${env.BUILD_TIMESTAMP}"
-                    echo "  Region: ${env.AWS_REGION}"
-                    echo "  Cluster: ${env.ECS_CLUSTER}"
-                    echo "  Task Definition: ${env.TASK_DEFINITION}"
+                    if (!env.NORMALIZED_TEST_SUITE.startsWith('Test Suites/')) {
+                        env.NORMALIZED_TEST_SUITE = "Test Suites/${env.NORMALIZED_TEST_SUITE}"
+                    }
+
+                    echo "BUILD_TIMESTAMP=${env.BUILD_TIMESTAMP}"
+                    echo "TEST_SUITE=${env.NORMALIZED_TEST_SUITE}"
+                    echo "KATALON_PROJECT_PATH=${params.KATALON_PROJECT_PATH}"
+                    echo "AWS_REGION=${env.AWS_REGION}"
+                    echo "ECS_CLUSTER=${env.ECS_CLUSTER}"
+                    echo "ECS_TASK_DEFINITION=${env.ECS_TASK_DEFINITION}"
+                    echo "ECS_CONTAINER_NAME=${env.ECS_CONTAINER_NAME}"
                 }
             }
         }
 
-        stage('Validate Agent Tooling') {
+        stage('Tool Check') {
             steps {
-                sh '''#!/usr/bin/env bash
-                    set -euo pipefail
+                sh '''
+                    set -e
                     command -v aws >/dev/null 2>&1 || {
-                      echo "ERROR: aws CLI is not installed on this Jenkins agent"
+                      echo "ERROR: aws CLI not found on Jenkins agent"
                       exit 1
                     }
                     aws --version
+                    aws sts get-caller-identity
                 '''
             }
         }
 
-        stage('Start ECS Task') {
+        stage('Validate ECS Config') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Checking ECS cluster..."
+                    aws ecs describe-clusters \
+                      --region "$AWS_REGION" \
+                      --clusters "$ECS_CLUSTER" \
+                      --query 'clusters[0].clusterName' \
+                      --output text
+
+                    echo "Checking task definition..."
+                    aws ecs describe-task-definition \
+                      --region "$AWS_REGION" \
+                      --task-definition "$ECS_TASK_DEFINITION" \
+                      --query 'taskDefinition.family' \
+                      --output text
+
+                    echo "Checking container name in task definition..."
+                    aws ecs describe-task-definition \
+                      --region "$AWS_REGION" \
+                      --task-definition "$ECS_TASK_DEFINITION" \
+                      --query "contains(taskDefinition.containerDefinitions[].name, \`$ECS_CONTAINER_NAME\`)" \
+                      --output text
+                '''
+            }
+        }
+
+        stage('Run Katalon on ECS') {
             steps {
                 withCredentials([
-                    string(credentialsId: 'katalon-api-key', variable: 'KATALON_API_KEY')
+                    string(
+                        credentialsId: 'katalon-api-key',
+                        variable: 'KATALON_API_KEY'
+                    )
                 ]) {
                     script {
-                        def suitePath = params.TEST_SUITE.startsWith('Test Suites/')
-                            ? params.TEST_SUITE
-                            : "Test Suites/${params.TEST_SUITE}"
+                        def commandList = [
+                            '-runMode=console',
+                            "-projectPath=${params.KATALON_PROJECT_PATH}",
+                            "-testSuitePath=${env.NORMALIZED_TEST_SUITE}",
+                            '-browserType=Chrome',
+                            "-apiKey=${env.KATALON_API_KEY}",
+                            "-orgID=${env.KATALON_ORG_ID}",
+                            '-retry=0',
+                            '-statusDelay=15',
+                            "-buildLabel=jenkins-${env.BUILD_NUMBER}-${env.BUILD_TIMESTAMP}"
+                        ]
 
-                        def overrides = [
+                        def overridesMap = [
                             containerOverrides: [[
-                                name: 'katalon',
-                                environment: [
-                                    [name: 'TEST_SUITE', value: params.TEST_SUITE],
-                                    [name: 'TARGET_URL', value: params.TARGET_URL],
-                                    [name: 'BROWSER', value: params.BROWSER],
-                                    [name: 'BUILD_ID', value: env.BUILD_TIMESTAMP],
-                                    [name: 'JENKINS_BUILD_NUMBER', value: env.BUILD_NUMBER],
-                                    [name: 'S3_BUCKET', value: env.S3_RESULTS_BUCKET]
-                                ],
-                                command: [
-                                    'katalonc',
-                                    "-projectPath=${env.PROJECT_PATH}",
-                                    "-browserType=${params.BROWSER}",
-                                    '-retry=0',
-                                    '-statusDelay=15',
-                                    "-testSuitePath=${suitePath}",
-                                    "-apiKey=${KATALON_API_KEY}",
-                                    "-orgID=${env.KATALON_ORG_ID}"
-                                ]
+                                name   : env.ECS_CONTAINER_NAME,
+                                command: commandList
                             ]]
                         ]
 
-                        writeFile(
-                            file: 'ecs-overrides.json',
-                            text: groovy.json.JsonOutput.prettyPrint(
-                                groovy.json.JsonOutput.toJson(overrides)
-                            )
-                        )
+                        def overridesJson = groovy.json.JsonOutput.toJson(overridesMap)
+                        writeFile file: 'ecs-overrides.json', text: overridesJson
 
-                        echo 'Starting Katalon test on ECS Fargate...'
+                        echo 'ECS container override JSON:'
+                        echo groovy.json.JsonOutput.prettyPrint(overridesJson)
 
-                        env.TASK_ARN = sh(
-                            script: '''#!/usr/bin/env bash
-                                set -euo pipefail
+                        def taskArn = sh(
+                            script: """
                                 aws ecs run-task \
-                                  --region "$AWS_REGION" \
-                                  --cluster "$ECS_CLUSTER" \
-                                  --task-definition "$TASK_DEFINITION" \
+                                  --region '${env.AWS_REGION}' \
+                                  --cluster '${env.ECS_CLUSTER}' \
+                                  --task-definition '${env.ECS_TASK_DEFINITION}' \
                                   --launch-type FARGATE \
-                                  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUP],assignPublicIp=DISABLED}" \
+                                  --count 1 \
                                   --overrides file://ecs-overrides.json \
                                   --query 'tasks[0].taskArn' \
                                   --output text
-                            ''',
+                            """,
                             returnStdout: true
                         ).trim()
 
-                        if (!env.TASK_ARN || env.TASK_ARN == 'None' || env.TASK_ARN == 'null') {
-                            error('Failed to start ECS task')
+                        if (!taskArn || taskArn == 'None' || taskArn == 'null') {
+                            sh """
+                                aws ecs run-task \
+                                  --region '${env.AWS_REGION}' \
+                                  --cluster '${env.ECS_CLUSTER}' \
+                                  --task-definition '${env.ECS_TASK_DEFINITION}' \
+                                  --launch-type FARGATE \
+                                  --count 1 \
+                                  --overrides file://ecs-overrides.json
+                            """
+                            error('Failed to start ECS task: no taskArn returned')
                         }
 
-                        env.TASK_ID = env.TASK_ARN.tokenize('/').last()
+                        env.ECS_TASK_ARN = taskArn
+                        env.ECS_TASK_ID = taskArn.tokenize('/').last()
 
-                        echo "ECS Task Started:"
-                        echo "  Task ARN: ${env.TASK_ARN}"
-                        echo "  Task ID: ${env.TASK_ID}"
-                    }
-                }
-            }
-        }
+                        echo "Started ECS task: ${env.ECS_TASK_ARN}"
 
-        stage('Monitor Task') {
-            when {
-                expression { params.WAIT_FOR_COMPLETION }
-            }
-            steps {
-                script {
-                    echo 'Monitoring ECS task execution...'
+                        sh """
+                            aws ecs wait tasks-stopped \
+                              --region '${env.AWS_REGION}' \
+                              --cluster '${env.ECS_CLUSTER}' \
+                              --tasks '${env.ECS_TASK_ARN}'
+                        """
 
-                    waitUntil(initialRecurrencePeriod: 10000) {
-                        def taskStatus = sh(
-                            script: '''#!/usr/bin/env bash
-                                set -euo pipefail
+                        def exitCode = sh(
+                            script: """
                                 aws ecs describe-tasks \
-                                  --region "$AWS_REGION" \
-                                  --cluster "$ECS_CLUSTER" \
-                                  --tasks "$TASK_ARN" \
-                                  --query 'tasks[0].lastStatus' \
+                                  --region '${env.AWS_REGION}' \
+                                  --cluster '${env.ECS_CLUSTER}' \
+                                  --tasks '${env.ECS_TASK_ARN}' \
+                                  --query "tasks[0].containers[?name=='${env.ECS_CONTAINER_NAME}'].exitCode | [0]" \
                                   --output text
-                            ''',
+                            """,
                             returnStdout: true
                         ).trim()
 
-                        echo "Task Status: ${taskStatus}"
-                        return taskStatus == 'STOPPED'
+                        def stopReason = sh(
+                            script: """
+                                aws ecs describe-tasks \
+                                  --region '${env.AWS_REGION}' \
+                                  --cluster '${env.ECS_CLUSTER}' \
+                                  --tasks '${env.ECS_TASK_ARN}' \
+                                  --query "tasks[0].stoppedReason" \
+                                  --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        def lastStatus = sh(
+                            script: """
+                                aws ecs describe-tasks \
+                                  --region '${env.AWS_REGION}' \
+                                  --cluster '${env.ECS_CLUSTER}' \
+                                  --tasks '${env.ECS_TASK_ARN}' \
+                                  --query "tasks[0].lastStatus" \
+                                  --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        echo "Task last status: ${lastStatus}"
+                        echo "Task stopped reason: ${stopReason}"
+                        echo "Container exit code: ${exitCode}"
+
+                        if (exitCode != '0') {
+                            error(
+                                "Katalon ECS task failed. " +
+                                "taskArn=${env.ECS_TASK_ARN}, exitCode=${exitCode}, " +
+                                "stoppedReason=${stopReason}"
+                            )
+                        }
                     }
                 }
-            }
-        }
-
-        stage('Check Results') {
-            when {
-                expression { params.WAIT_FOR_COMPLETION }
-            }
-            steps {
-                script {
-                    def exitCode = sh(
-                        script: '''#!/usr/bin/env bash
-                            set -euo pipefail
-                            aws ecs describe-tasks \
-                              --region "$AWS_REGION" \
-                              --cluster "$ECS_CLUSTER" \
-                              --tasks "$TASK_ARN" \
-                              --query 'tasks[0].containers[0].exitCode' \
-                              --output text
-                        ''',
-                        returnStdout: true
-                    ).trim()
-
-                    def stopReason = sh(
-                        script: '''#!/usr/bin/env bash
-                            set -euo pipefail
-                            aws ecs describe-tasks \
-                              --region "$AWS_REGION" \
-                              --cluster "$ECS_CLUSTER" \
-                              --tasks "$TASK_ARN" \
-                              --query 'tasks[0].stoppedReason' \
-                              --output text
-                        ''',
-                        returnStdout: true
-                    ).trim()
-
-                    echo "Task Exit Code: ${exitCode}"
-                    echo "Stop Reason: ${stopReason}"
-
-                    if (exitCode != '0') {
-                        error("Katalon tests failed with exit code: ${exitCode}")
-                    }
-                }
-            }
-        }
-
-        stage('Download Test Results') {
-            when {
-                expression { params.WAIT_FOR_COMPLETION }
-            }
-            steps {
-                sh '''#!/usr/bin/env bash
-                    set -euo pipefail
-                    mkdir -p "$WORKSPACE/test-results"
-                    aws s3 sync \
-                      "s3://$S3_RESULTS_BUCKET/builds/$BUILD_NUMBER/" \
-                      "$WORKSPACE/test-results/" || echo "No results found in S3"
-                '''
-
-                archiveArtifacts artifacts: 'test-results/**/*', allowEmptyArchive: true
-            }
-        }
-
-        stage('View Logs') {
-            steps {
-                echo "CloudWatch Logs:"
-                echo "  Log Group: ${env.CW_LOG_GROUP}"
-                echo "  Task ID: ${env.TASK_ID}"
-                echo ''
-                echo 'View logs with:'
-                echo "  aws logs tail ${env.CW_LOG_GROUP} --follow --region ${env.AWS_REGION}"
             }
         }
     }
 
     post {
         always {
-            echo '═══════════════════════════════════════════════'
-            echo 'Build Summary:'
-            echo "  Build Number: ${env.BUILD_NUMBER}"
-            echo "  Build Timestamp: ${env.BUILD_TIMESTAMP ?: 'n/a'}"
-            echo "  Test Suite: ${params.TEST_SUITE}"
-            echo "  Target URL: ${params.TARGET_URL}"
-            echo "  Task ARN: ${env.TASK_ARN ?: 'n/a'}"
-            echo "  Task ID: ${env.TASK_ID ?: 'n/a'}"
-            echo '═══════════════════════════════════════════════'
+            script {
+                if (env.ECS_TASK_ARN?.trim()) {
+                    echo "Final ECS task ARN: ${env.ECS_TASK_ARN}"
+                    echo "Open ECS task ${env.ECS_TASK_ID} in AWS console and review container logs."
+                } else {
+                    echo 'No ECS task ARN captured.'
+                }
+            }
+
+            archiveArtifacts artifacts: 'ecs-overrides.json', allowEmptyArchive: true
+            cleanWs(deleteDirs: true, notFailBuild: true)
         }
+
         success {
-            echo '✓ Katalon tests completed successfully!'
+            echo 'Katalon ECS run completed successfully.'
         }
+
         failure {
-            echo '✗ Katalon tests failed. Check ECS task status and CloudWatch logs.'
+            echo 'Katalon ECS run failed. Review ECS task events and CloudWatch logs.'
         }
     }
 }
