@@ -19,6 +19,21 @@ pipeline {
             defaultValue: '/katalon/project',
             description: 'Path to the Katalon project inside the ECS container'
         )
+        string(
+            name: 'SUBNET_IDS',
+            defaultValue: 'subnet-aaaaaaaa,subnet-bbbbbbbb',
+            description: 'Comma-separated subnet IDs for Fargate task networking'
+        )
+        string(
+            name: 'SECURITY_GROUP_IDS',
+            defaultValue: 'sg-aaaaaaaaaaaaaaaaa',
+            description: 'Comma-separated security group IDs for the Fargate task'
+        )
+        choice(
+            name: 'ASSIGN_PUBLIC_IP',
+            choices: ['DISABLED', 'ENABLED'],
+            description: 'Usually DISABLED for private subnets, ENABLED for public subnets'
+        )
     }
 
     environment {
@@ -57,6 +72,9 @@ pipeline {
                     echo "ECS_TASK_DEFINITION=${env.ECS_TASK_DEFINITION}"
                     echo "ECS_CONTAINER_NAME=${env.ECS_CONTAINER_NAME}"
                     echo "CW_LOG_GROUP=${env.CW_LOG_GROUP}"
+                    echo "SUBNET_IDS=${params.SUBNET_IDS}"
+                    echo "SECURITY_GROUP_IDS=${params.SECURITY_GROUP_IDS}"
+                    echo "ASSIGN_PUBLIC_IP=${params.ASSIGN_PUBLIC_IP}"
                 }
             }
         }
@@ -120,6 +138,24 @@ pipeline {
                     )
                 ]) {
                     script {
+                        def subnetList = params.SUBNET_IDS
+                            .split(',')
+                            .collect { it.trim() }
+                            .findAll { it }
+
+                        def securityGroupList = params.SECURITY_GROUP_IDS
+                            .split(',')
+                            .collect { it.trim() }
+                            .findAll { it }
+
+                        if (subnetList.isEmpty()) {
+                            error('SUBNET_IDS cannot be empty')
+                        }
+
+                        if (securityGroupList.isEmpty()) {
+                            error('SECURITY_GROUP_IDS cannot be empty')
+                        }
+
                         def commandList = [
                             '-runMode=console',
                             "-projectPath=${params.KATALON_PROJECT_PATH}",
@@ -139,12 +175,27 @@ pipeline {
                             ]]
                         ]
 
+                        def networkConfigMap = [
+                            awsvpcConfiguration: [
+                                subnets       : subnetList,
+                                securityGroups: securityGroupList,
+                                assignPublicIp: params.ASSIGN_PUBLIC_IP
+                            ]
+                        ]
+
                         def overridesJson =
                             groovy.json.JsonOutput.toJson(overridesMap)
+                        def networkConfigJson =
+                            groovy.json.JsonOutput.toJson(networkConfigMap)
+
                         writeFile file: 'ecs-overrides.json', text: overridesJson
+                        writeFile file: 'ecs-network-config.json', text: networkConfigJson
 
                         echo 'ECS container override JSON:'
                         echo groovy.json.JsonOutput.prettyPrint(overridesJson)
+
+                        echo 'ECS network config JSON:'
+                        echo groovy.json.JsonOutput.prettyPrint(networkConfigJson)
 
                         def taskArn = sh(
                             script: """
@@ -154,6 +205,7 @@ pipeline {
                                   --task-definition '${env.ECS_TASK_DEFINITION}' \
                                   --launch-type FARGATE \
                                   --count 1 \
+                                  --network-configuration file://ecs-network-config.json \
                                   --overrides file://ecs-overrides.json \
                                   --query 'tasks[0].taskArn' \
                                   --output text
@@ -169,6 +221,7 @@ pipeline {
                                   --task-definition '${env.ECS_TASK_DEFINITION}' \
                                   --launch-type FARGATE \
                                   --count 1 \
+                                  --network-configuration file://ecs-network-config.json \
                                   --overrides file://ecs-overrides.json
                             """
                             error('Failed to start ECS task: no taskArn returned')
@@ -253,7 +306,7 @@ pipeline {
                 }
             }
 
-            archiveArtifacts artifacts: 'ecs-overrides.json', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'ecs-overrides.json,ecs-network-config.json', allowEmptyArchive: true
             cleanWs(deleteDirs: true, notFailBuild: true)
         }
 
