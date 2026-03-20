@@ -36,14 +36,14 @@ pipeline {
         )
     }
 
-   environment {
-    AWS_REGION          = 'us-west-2'
-    ECS_CLUSTER         = 'katalon-testing-dev-cluster'
-    ECS_TASK_DEFINITION = 'katalon-testing-dev-katalon'
-    ECS_CONTAINER_NAME  = 'katalon-container'
-    KATALON_ORG_ID      = '2333388'
-    CW_LOG_GROUP        = '/ecs/katalon-testing-dev-katalon'
-}
+    environment {
+        AWS_REGION          = 'us-west-2'
+        ECS_CLUSTER         = 'katalon-testing-dev-cluster'
+        ECS_TASK_DEFINITION = 'katalon-testing-dev-katalon'
+        ECS_CONTAINER_NAME  = 'katalon-container'
+        KATALON_ORG_ID      = '2333388'
+        CW_LOG_GROUP        = '/ecs/katalon-testing-dev-katalon'
+    }
 
     stages {
         stage('Init') {
@@ -124,8 +124,7 @@ pipeline {
                             "-apiKey=${cleanApiKey}",
                             "-orgID=${env.KATALON_ORG_ID}",
                             "-retry=0",
-                            "-statusDelay=15",
-                            "-buildLabel=jenkins-${env.BUILD_NUMBER}-${env.BUILD_TIMESTAMP}"
+                            "-statusDelay=15"
                         ]
 
                         def overridesMap = [
