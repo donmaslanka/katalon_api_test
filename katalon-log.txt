@@ -1,0 +1,2 @@
+
+'charmap' codec can't encode character '\uf03a' in position 3824: character maps to <undefined>

@@ -1,412 +1,174 @@
-# Katalon ECS Testing Infrastructure
+# Katalon on ECS — Jenkins pipeline
 
-This Terraform project creates a complete AWS infrastructure for running Katalon automated tests in ECS Fargate containers, integrated with an existing Jenkins server.
+Run Katalon test suites on AWS ECS Fargate, triggered from a Jenkins pipeline running on an EC2 agent.
 
-## Architecture Overview
+---
+
+## How it works
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         AWS Account                          │
-│                       (318798562215)                         │
-│                                                              │
-│  ┌────────────────────────────────────────────────────────┐ │
-│  │                  Custom VPC (10.0.0.0/16)              │ │
-│  │                                                         │ │
-│  │  ┌──────────────┐            ┌──────────────┐         │ │
-│  │  │   Public     │            │   Public     │         │ │
-│  │  │   Subnet     │            │   Subnet     │         │ │
-│  │  │ (10.0.1.0/24)│            │ (10.0.2.0/24)│         │ │
-│  │  │              │            │              │         │ │
-│  │  │  NAT Gateway │            │  NAT Gateway │         │ │
-│  │  └──────┬───────┘            └──────┬───────┘         │ │
-│  │         │                           │                  │ │
-│  │  ┌──────▼───────┐            ┌──────▼───────┐         │ │
-│  │  │   Private    │            │   Private    │         │ │
-│  │  │   Subnet     │            │   Subnet     │         │ │
-│  │  │(10.0.10.0/24)│            │(10.0.11.0/24)│         │ │
-│  │  │              │            │              │         │ │
-│  │  │  ECS Tasks   │            │  ECS Tasks   │         │ │
-│  │  │  (Katalon)   │            │  (Katalon)   │         │ │
-│  │  └──────────────┘            └──────────────┘         │ │
-│  │                                                         │ │
-│  └─────────────────────────────────────────────────────────┘ │
-│                                                              │
-│  ┌────────────────┐  ┌─────────────────┐  ┌──────────────┐ │
-│  │ ECS Cluster    │  │ S3 Bucket       │  │ CloudWatch   │ │
-│  │ (Fargate)      │  │ (Test Results)  │  │ (Logs)       │ │
-│  └────────────────┘  └─────────────────┘  └──────────────┘ │
-│                                                              │
-│  Existing Jenkins EC2 → Triggers ECS Tasks via AWS API      │
-└─────────────────────────────────────────────────────────────┘
+GitHub repo (Jenkinsfile)
+        │
+        ▼ pipeline trigger
+Jenkins EC2 agent
+  • runs aws cli only
+  • needs: aws cli, IAM instance profile
+        │
+        │  aws ecs run-task  (Fargate, --overrides passes katalonc args)
+        ▼
+ECS Fargate task  ──pulls image──▶  ECR
+  katalon-container                 katalon-test-runner:<tag>
+  ENTRYPOINT: katalonc                  (built from docker_image/Dockerfile)
+        │
+        ├──logs──▶  CloudWatch  /ecs/katalon-testing-dev-katalon
+        └──results▶  Katalon TestOps  (org 2333388, API key auth)
 ```
 
-## Features
+The Jenkins EC2 agent does **not** run Katalon directly. It only calls the AWS API. Katalon runs inside the Fargate container and reports results to Katalon TestOps. Jenkins blocks on `aws ecs wait tasks-stopped` and then checks the container exit code to determine pass/fail.
 
-- **Modular Terraform Design**: Reusable modules for VPC, ECS, IAM, and Security Groups
-- **Complete Networking**: Custom VPC with public/private subnets, NAT gateways, and VPC endpoints
-- **ECS Fargate**: Serverless container execution for cost efficiency
-- **Jenkins Integration**: IAM roles and policies for Jenkins to trigger ECS tasks
-- **Security**: Proper security groups, private subnets, and least-privilege IAM roles
-- **Logging**: CloudWatch Logs integration for all container output
-- **Test Results Storage**: S3 bucket with lifecycle policies for test results
-- **Cost Optimization**: VPC endpoints to reduce NAT gateway costs
+---
 
 ## Prerequisites
 
-1. **AWS Account**: Access to account `318798562215`
-2. **AWS CLI**: Configured with appropriate credentials
-3. **Terraform**: Version 1.0 or higher
-4. **Jenkins Server**: 
-   - Option A: Use existing EC2 instance (will need its private IP)
-   - Option B: Create new Jenkins server from AMI using the Jenkins module
-5. **SSH Key Pair**: For Jenkins EC2 access (if creating new Jenkins server)
-
-## Project Structure
-
-```
-katalon-ecs-terraform/
-├── main.tf                      # Root module configuration
-├── variables.tf                 # Root variable definitions
-├── outputs.tf                   # Root outputs
-├── terraform.tfvars.example     # Example variable values
-├── modules/
-│   ├── vpc/                     # VPC module
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   ├── ecs/                     # ECS module
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   ├── iam/                     # IAM module
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   ├── security-groups/         # Security Groups module
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   └── jenkins/                 # Jenkins module (optional)
-│       ├── main.tf
-│       ├── variables.tf
-│       ├── outputs.tf
-│       ├── user-data.sh
-│       └── README.md
-└── README.md
-```
-
-## Quick Start
-
-### 1. Clone and Configure
+### AWS infrastructure (Terraform)
 
 ```bash
-cd katalon-ecs-terraform
-cp terraform.tfvars.example terraform.tfvars
-```
-
-### 2. Edit terraform.tfvars
-
-Update the following values in `terraform.tfvars`:
-
-```hcl
-# Required: Update with your Jenkins server's private IP
-jenkins_server_ip = "10.0.5.100/32"  # Replace with actual IP
-
-# Optional: Customize other values
-aws_region     = "us-east-1"
-project_name   = "katalon-testing"
-environment    = "dev"
-```
-
-### 3. Initialize Terraform
-
-```bash
+cd <repo-root>
+cp terraform.tfvars.example terraform.tfvars   # fill in your values
 terraform init
-```
-
-### 4. Review the Plan
-
-```bash
-terraform plan
-```
-
-### 5. Deploy Infrastructure
-
-```bash
 terraform apply
 ```
 
-Review the changes and type `yes` to confirm.
+Terraform creates: VPC + subnets, ECS cluster, Fargate task definition, IAM roles, CloudWatch log group, S3 bucket for results, and (optionally) the Jenkins EC2 instance.
 
-## Jenkins Configuration
+After `terraform apply`, note the outputs — you will need the subnet IDs and security group ID for the Jenkins pipeline parameters.
 
-After deploying the infrastructure, you'll need to configure Jenkins to trigger ECS tasks.
+### Jenkins
 
-### Option 1: Attach IAM Instance Profile
+1. **Agent label** — the EC2 instance must be registered as a Jenkins agent with the label `ec2-agent` (or update the `agent { label ... }` line in the Jenkinsfile).
+2. **IAM instance profile** — the EC2 must have an instance profile that allows `ecs:RunTask`, `ecs:DescribeTasks`, `ecs:StopTask`, and `iam:PassRole` on the ECS execution and task roles. Terraform creates this profile as part of `modules/iam`.
+3. **Credential** — add a *Secret Text* credential in Jenkins with ID `katalon-api-key`. The value is your Katalon API key (with or without the `apiKey=` prefix — the pipeline strips it).
+4. **Pipeline job** — create a Pipeline job pointing at this repo. Set *Script Path* to `Jenkinsfile`.
 
-1. Get the instance profile name from Terraform output:
-   ```bash
-   terraform output jenkins_integration_info
-   ```
+### Docker image
 
-2. Attach the instance profile to your Jenkins EC2 instance:
-   ```bash
-   aws ec2 associate-iam-instance-profile \
-     --instance-id i-xxxxxxxxxxxxx \
-     --iam-instance-profile Name=<instance-profile-name>
-   ```
-
-### Option 2: Jenkins Pipeline Example
-
-Create a Jenkins pipeline job with the following script:
-
-```groovy
-pipeline {
-    agent any
-    
-    parameters {
-        string(name: 'TEST_SUITE', defaultValue: 'smoke-tests', description: 'Test suite to run')
-        string(name: 'TARGET_URL', defaultValue: 'https://example.com', description: 'Target website URL')
-    }
-    
-    environment {
-        AWS_REGION = 'us-east-1'
-        ECS_CLUSTER = '<cluster-name-from-output>'
-        TASK_DEFINITION = '<task-definition-from-output>'
-        SUBNETS = '<subnet-ids-from-output>'
-        SECURITY_GROUP = '<security-group-from-output>'
-    }
-    
-    stages {
-        stage('Run Katalon Tests') {
-            steps {
-                script {
-                    // Run ECS task
-                    def taskArn = sh(
-                        script: """
-                            aws ecs run-task \\
-                                --cluster ${ECS_CLUSTER} \\
-                                --task-definition ${TASK_DEFINITION} \\
-                                --launch-type FARGATE \\
-                                --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SECURITY_GROUP}],assignPublicIp=DISABLED}" \\
-                                --overrides '{
-                                    "containerOverrides": [{
-                                        "name": "katalon",
-                                        "environment": [
-                                            {"name": "TEST_SUITE", "value": "${params.TEST_SUITE}"},
-                                            {"name": "TARGET_URL", "value": "${params.TARGET_URL}"}
-                                        ]
-                                    }]
-                                }' \\
-                                --query 'tasks[0].taskArn' \\
-                                --output text
-                        """,
-                        returnStdout: true
-                    ).trim()
-                    
-                    echo "Started ECS task: ${taskArn}"
-                    
-                    // Wait for task completion
-                    sh """
-                        aws ecs wait tasks-stopped \\
-                            --cluster ${ECS_CLUSTER} \\
-                            --tasks ${taskArn}
-                    """
-                    
-                    // Check task exit code
-                    def exitCode = sh(
-                        script: """
-                            aws ecs describe-tasks \\
-                                --cluster ${ECS_CLUSTER} \\
-                                --tasks ${taskArn} \\
-                                --query 'tasks[0].containers[0].exitCode' \\
-                                --output text
-                        """,
-                        returnStdout: true
-                    ).trim()
-                    
-                    if (exitCode != '0') {
-                        error("Katalon tests failed with exit code: ${exitCode}")
-                    }
-                }
-            }
-        }
-        
-        stage('Retrieve Results') {
-            steps {
-                script {
-                    // Download test results from S3
-                    sh """
-                        aws s3 sync s3://<s3-bucket-from-output>/\${BUILD_NUMBER}/ ./test-results/
-                    """
-                    
-                    // Publish results
-                    publishHTML([
-                        allowMissing: false,
-                        alwaysLinkToLastBuild: true,
-                        keepAll: true,
-                        reportDir: 'test-results',
-                        reportFiles: 'report.html',
-                        reportName: 'Katalon Test Report'
-                    ])
-                }
-            }
-        }
-    }
-}
-```
-
-### Option 3: AWS CLI Direct Execution
-
-Run tests directly from command line:
+The Katalon project is baked into the image at build time.
 
 ```bash
-# Get values from Terraform output
-terraform output jenkins_integration_info
+cd docker_image
+IMAGE=318798562215.dkr.ecr.us-west-2.amazonaws.com/katalon-test-runner
 
-# Run task
-aws ecs run-task \
-  --cluster katalon-testing-dev-cluster \
-  --task-definition katalon-testing-dev-katalon \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[subnet-xxx,subnet-yyy],securityGroups=[sg-zzz],assignPublicIp=DISABLED}" \
-  --overrides '{
-    "containerOverrides": [{
-      "name": "katalon",
-      "environment": [
-        {"name": "TEST_SUITE", "value": "smoke-tests"},
-        {"name": "TARGET_URL", "value": "https://example.com"}
-      ]
-    }]
-  }'
+# Authenticate to ECR
+aws ecr get-login-password --region us-west-2 \
+  | docker login --username AWS --password-stdin \
+      318798562215.dkr.ecr.us-west-2.amazonaws.com
+
+# Build and push
+docker build -t $IMAGE:my-tag .
+docker push $IMAGE:my-tag
 ```
 
-## Customization
-
-### Adjust Container Resources
-
-In `terraform.tfvars`:
-
-```hcl
-katalon_cpu    = 4096  # 4 vCPU
-katalon_memory = 8192  # 8 GB
-```
-
-### Use Custom Katalon Image
-
-If you have a custom Katalon Docker image in ECR:
-
-```hcl
-katalon_image = "318798562215.dkr.ecr.us-east-1.amazonaws.com/my-katalon:latest"
-```
-
-### Multi-Environment Setup
-
-Create environment-specific variable files:
+Then update `katalon_image` in `terraform.tfvars` and run `terraform apply` to register a new task definition revision, or register it manually:
 
 ```bash
-# Development
-terraform apply -var-file="environments/dev/terraform.tfvars"
-
-# Staging
-terraform apply -var-file="environments/staging/terraform.tfvars"
-
-# Production
-terraform apply -var-file="environments/prod/terraform.tfvars"
+# Edit katalon-task-def.json to point at your new image tag, then:
+aws ecs register-task-definition \
+  --cli-input-json file://katalon-task-def.json \
+  --region us-west-2
 ```
 
-## Cost Optimization
+---
 
-- **VPC Endpoints**: Included to reduce NAT Gateway data transfer costs
-- **Fargate Spot**: Can be enabled for cost savings (may have interruptions)
-- **S3 Lifecycle**: Automatically deletes old test results after 90 days
-- **CloudWatch Logs**: Retention set to 7 days (adjust as needed)
+## Running tests
 
-### Estimated Monthly Costs (Development)
+Trigger the Jenkins pipeline manually or via webhook. The available parameters are:
 
-- **VPC**: NAT Gateways (~$64/month for 2 AZs)
-- **ECS Fargate**: $0 when not running, ~$0.04/hour when running (2vCPU, 4GB)
-- **S3 Storage**: ~$0.023/GB
-- **CloudWatch Logs**: ~$0.50/GB ingested
-- **VPC Endpoints**: ~$7/month per endpoint
+| Parameter | Default | Description |
+|---|---|---|
+| `TEST_SUITE` | `Test Suites/Smoke` | Suite path inside the container. Short form `Smoke` is also accepted. |
+| `KATALON_PROJECT_PATH` | `/katalon/project` | Project path inside the container. Matches the Dockerfile `WORKDIR`. |
+| `SUBNET_IDS` | `subnet-0968b2a4486c2c297` | Private subnet(s) for the Fargate task. From Terraform output `private_subnet_ids`. |
+| `SECURITY_GROUP_IDS` | `sg-014254f1dc8168a1a` | Security group(s). From Terraform output `ecs_task_security_group_id`. |
+| `ASSIGN_PUBLIC_IP` | `DISABLED` | `DISABLED` for private subnets. `ENABLED` only if the subnet has no NAT gateway. |
 
-## Monitoring
+---
 
-### CloudWatch Logs
+## Viewing logs
 
-View container logs:
-```bash
-aws logs tail /ecs/katalon-testing-dev-katalon --follow
+After a run, the pipeline prints the exact CloudWatch log stream path:
+
+```
+ecs/katalon-container/<task-id>
 ```
 
-### ECS Task Monitoring
+Fetch logs directly:
 
 ```bash
-# List running tasks
-aws ecs list-tasks --cluster katalon-testing-dev-cluster
-
-# Describe task
-aws ecs describe-tasks --cluster katalon-testing-dev-cluster --tasks <task-arn>
+aws logs get-log-events \
+  --log-group-name /ecs/katalon-testing-dev-katalon \
+  --log-stream-name ecs/katalon-container/<task-id> \
+  --region us-west-2
 ```
 
-### S3 Test Results
+Or open the CloudWatch console — the pipeline prints a direct link in the build log.
 
-```bash
-# List test results
-aws s3 ls s3://<bucket-name>/
+---
 
-# Download results
-aws s3 sync s3://<bucket-name>/test-run-123/ ./local-results/
+## Repository layout
+
+```
+.
+├── Jenkinsfile                  # Pipeline definition — only file Jenkins reads
+├── katalon-task-def.json        # ECS task definition (reference / manual registration)
+├── terraform.tfvars             # Your environment values (gitignored in prod)
+├── terraform.tfvars.example     # Template — copy and fill in
+├── main.tf                      # Root Terraform config, wires modules together
+├── variables.tf                 # Root variable declarations
+├── outputs.tf                   # Terraform outputs (subnet IDs, SG IDs, etc.)
+├── docker_image/
+│   ├── Dockerfile               # Builds the Katalon runner image pushed to ECR
+│   └── BUILD.md                 # Docker build / push instructions
+└── modules/
+    ├── ecs/                     # ECS cluster, Fargate task definition, S3 bucket
+    ├── iam/                     # IAM roles for ECS tasks and Jenkins EC2
+    ├── jenkins/                 # Jenkins EC2 instance (optional)
+    ├── security-groups/         # Security groups for ECS tasks
+    └── vpc/                     # VPC, subnets, NAT gateway
 ```
 
-## Security Considerations
+---
 
-1. **Network Isolation**: ECS tasks run in private subnets with no direct internet access
-2. **Least Privilege**: IAM roles follow least privilege principle
-3. **Encryption**: S3 bucket encrypted at rest
-4. **Logging**: All activities logged to CloudWatch
-5. **VPC Endpoints**: Direct AWS service access without internet routing
+## Key AWS resource names
+
+| Resource | Name |
+|---|---|
+| ECS cluster | `katalon-testing-dev-cluster` |
+| Task definition | `katalon-testing-dev-katalon` |
+| Container name | `katalon-container` |
+| ECR repo | `318798562215.dkr.ecr.us-west-2.amazonaws.com/katalon-test-runner` |
+| CloudWatch log group | `/ecs/katalon-testing-dev-katalon` |
+| AWS region | `us-west-2` |
+| AWS account | `318798562215` |
+
+---
 
 ## Troubleshooting
 
-### Task Fails to Start
+**`ECS run-task returned no taskArn`**
+- Verify the EC2 instance profile has `ecs:RunTask` and `iam:PassRole` on the execution and task roles.
+- Check that the task definition family name in the Jenkinsfile matches the registered definition exactly: `katalon-testing-dev-katalon`.
 
-Check security groups and subnet configuration:
-```bash
-aws ecs describe-tasks --cluster <cluster> --tasks <task-arn> --query 'tasks[0].stopCode'
-```
+**Task exits immediately with code 1**
+- The container command is wrong. Check the CloudWatch log stream — katalonc will print the specific error.
+- Common causes: bad `-projectPath`, wrong `-testSuitePath`, invalid API key.
 
-### Can't Pull Docker Image
+**`aws ecs wait tasks-stopped` times out**
+- The default AWS CLI waiter polls for 10 minutes (100 attempts × 6 s). If your test suite takes longer, increase the pipeline `timeout` option and consider implementing a custom polling loop.
 
-Verify IAM task execution role has ECR permissions:
-```bash
-aws iam get-role-policy --role-name <execution-role> --policy-name ecr-policy
-```
+**Task never starts (`PROVISIONING` stays forever)**
+- The subnet has no route to the internet (NAT gateway or IGW). Either set `ASSIGN_PUBLIC_IP=ENABLED` or add a NAT gateway to the private subnet.
+- The security group is blocking ECR image pulls (port 443 outbound required).
 
-### Network Connectivity Issues
-
-Check NAT Gateway status:
-```bash
-aws ec2 describe-nat-gateways --filter Name=vpc-id,Values=<vpc-id>
-```
-
-## Cleanup
-
-To destroy all resources:
-
-```bash
-terraform destroy
-```
-
-**Warning**: This will delete all resources including test results in S3.
-
-## Support and Contributing
-
-For issues or questions:
-1. Check Terraform documentation: https://registry.terraform.io/providers/hashicorp/aws/latest/docs
-2. Review AWS ECS documentation: https://docs.aws.amazon.com/ecs/
-3. Check Katalon documentation: https://docs.katalon.com/
-
-## License
-
-This project is provided as-is for internal use.
+**Katalon results not appearing in TestOps**
+- Confirm `KATALON_ORG_ID` in the Jenkinsfile matches your Katalon organisation.
+- Confirm the API key credential in Jenkins is correct and not expired.
