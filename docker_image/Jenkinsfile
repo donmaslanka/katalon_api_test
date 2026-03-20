@@ -1,0 +1,233 @@
+pipeline {
+    // Lock execution to the EC2 agent that has the AWS CLI + IAM instance profile.
+    // Change the label to match whatever label you assigned this node in Jenkins.
+    agent { label 'ec2-agent' }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
+    }
+
+    parameters {
+        string(
+            name: 'TEST_SUITE',
+            defaultValue: 'Test Suites/Smoke',
+            description: 'Katalon test suite path (e.g. "Test Suites/Smoke" or just "Smoke")'
+        )
+        string(
+            name: 'KATALON_PROJECT_PATH',
+            defaultValue: '/katalon/project',
+            description: 'Path to the Katalon project inside the ECS container (matches Dockerfile WORKDIR)'
+        )
+        string(
+            name: 'SUBNET_IDS',
+            defaultValue: 'subnet-0968b2a4486c2c297',
+            description: 'Comma-separated private subnet IDs for the Fargate task'
+        )
+        string(
+            name: 'SECURITY_GROUP_IDS',
+            defaultValue: 'sg-014254f1dc8168a1a',
+            description: 'Security group ID(s) for the Fargate task (comma-separated)'
+        )
+        choice(
+            name: 'ASSIGN_PUBLIC_IP',
+            choices: ['DISABLED', 'ENABLED'],
+            description: 'DISABLED for private subnets (standard); ENABLED only if subnet has no NAT gateway'
+        )
+    }
+
+    environment {
+        AWS_REGION          = 'us-west-2'
+        ECS_CLUSTER         = 'katalon-testing-dev-cluster'
+        // Must match the "family" field in the registered task definition.
+        ECS_TASK_DEFINITION = 'katalon-testing-dev-katalon'
+        // Must match the container name in the task definition.
+        ECS_CONTAINER_NAME  = 'katalon-container'
+        KATALON_ORG_ID      = '2333388'
+        CW_LOG_GROUP        = '/ecs/katalon-testing-dev-katalon'
+    }
+
+    stages {
+
+        stage('Init') {
+            steps {
+                script {
+                    env.BUILD_TIMESTAMP = sh(
+                        script: 'date +%Y%m%d-%H%M%S',
+                        returnStdout: true
+                    ).trim()
+
+                    // Normalise the suite path so callers can pass "Smoke" or the full path.
+                    env.NORMALIZED_TEST_SUITE = params.TEST_SUITE?.trim() ?: 'Test Suites/Smoke'
+                    if (!env.NORMALIZED_TEST_SUITE.startsWith('Test Suites/')) {
+                        env.NORMALIZED_TEST_SUITE = "Test Suites/${env.NORMALIZED_TEST_SUITE}"
+                    }
+
+                    echo "BUILD_TIMESTAMP      = ${env.BUILD_TIMESTAMP}"
+                    echo "TEST_SUITE           = ${env.NORMALIZED_TEST_SUITE}"
+                    echo "KATALON_PROJECT_PATH = ${params.KATALON_PROJECT_PATH}"
+                    echo "SUBNET_IDS           = ${params.SUBNET_IDS}"
+                    echo "SECURITY_GROUP_IDS   = ${params.SECURITY_GROUP_IDS}"
+                    echo "ASSIGN_PUBLIC_IP     = ${params.ASSIGN_PUBLIC_IP}"
+                }
+            }
+        }
+
+        stage('Verify AWS access') {
+            steps {
+                sh '''
+                    set -e
+                    command -v aws >/dev/null 2>&1 || {
+                        echo "ERROR: aws CLI not found on this Jenkins agent"
+                        exit 1
+                    }
+                    aws --version
+                    # Confirm the instance profile / credentials are working.
+                    aws sts get-caller-identity
+                '''
+            }
+        }
+
+        stage('Run Katalon on ECS') {
+            steps {
+                // The API key is stored as a Jenkins Secret Text credential with id 'katalon-api-key'.
+                // It may be stored as the raw key or in "apiKey=<value>" format — we strip the prefix.
+                withCredentials([
+                    string(credentialsId: 'katalon-api-key', variable: 'KATALON_API_KEY')
+                ]) {
+                    script {
+                        def subnetList = params.SUBNET_IDS
+                            .split(',').collect { it.trim() }.findAll { it }
+                        def sgList = params.SECURITY_GROUP_IDS
+                            .split(',').collect { it.trim() }.findAll { it }
+
+                        if (subnetList.isEmpty()) { error('SUBNET_IDS cannot be empty') }
+                        if (sgList.isEmpty())     { error('SECURITY_GROUP_IDS cannot be empty') }
+
+                        def cleanApiKey = env.KATALON_API_KEY?.trim()
+                            ?.replaceFirst(/^apiKey=/, '')
+
+                        // These args are forwarded verbatim to katalonc inside the container.
+                        // The task definition sets ENTRYPOINT ["katalonc"], so this becomes the CMD.
+                        def commandList = [
+                            "-runMode=console",
+                            "-projectPath=${params.KATALON_PROJECT_PATH}",
+                            "-testSuitePath=${env.NORMALIZED_TEST_SUITE}",
+                            "-browserType=Chrome",
+                            "-apiKey=${cleanApiKey}",
+                            "-orgID=${env.KATALON_ORG_ID}",
+                            "-retry=0",
+                            "-statusDelay=15"
+                        ]
+
+                        def overrides = [
+                            containerOverrides: [[
+                                name:    env.ECS_CONTAINER_NAME,
+                                command: commandList
+                            ]]
+                        ]
+
+                        def networkConfig = [
+                            awsvpcConfiguration: [
+                                subnets:         subnetList,
+                                securityGroups:  sgList,
+                                assignPublicIp:  params.ASSIGN_PUBLIC_IP
+                            ]
+                        ]
+
+                        writeFile file: 'ecs-overrides.json',
+                                  text: groovy.json.JsonOutput.toJson(overrides)
+                        writeFile file: 'ecs-network-config.json',
+                                  text: groovy.json.JsonOutput.toJson(networkConfig)
+
+                        // ── Launch the Fargate task ──────────────────────────────────────
+                        def taskArn = sh(
+                            script: """
+                                aws ecs run-task \\
+                                  --region '${env.AWS_REGION}' \\
+                                  --cluster '${env.ECS_CLUSTER}' \\
+                                  --task-definition '${env.ECS_TASK_DEFINITION}' \\
+                                  --launch-type FARGATE \\
+                                  --count 1 \\
+                                  --network-configuration file://ecs-network-config.json \\
+                                  --overrides file://ecs-overrides.json \\
+                                  --query 'tasks[0].taskArn' \\
+                                  --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (!taskArn || taskArn == 'None' || taskArn == 'null') {
+                            error('ECS run-task returned no taskArn — check IAM permissions and task definition name')
+                        }
+
+                        env.ECS_TASK_ARN = taskArn
+                        env.ECS_TASK_ID  = taskArn.tokenize('/').last()
+                        echo "Started ECS task: ${env.ECS_TASK_ARN}"
+
+                        // ── Block until the task stops (polls every 6 s, times out at 10 min) ─
+                        sh """
+                            aws ecs wait tasks-stopped \\
+                              --region '${env.AWS_REGION}' \\
+                              --cluster '${env.ECS_CLUSTER}' \\
+                              --tasks '${env.ECS_TASK_ARN}'
+                        """
+
+                        // ── Collect exit code and stop reason ───────────────────────────
+                        def exitCode = sh(
+                            script: """
+                                aws ecs describe-tasks \\
+                                  --region '${env.AWS_REGION}' \\
+                                  --cluster '${env.ECS_CLUSTER}' \\
+                                  --tasks '${env.ECS_TASK_ARN}' \\
+                                  --query "tasks[0].containers[?name=='${env.ECS_CONTAINER_NAME}'].exitCode | [0]" \\
+                                  --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        def stopReason = sh(
+                            script: """
+                                aws ecs describe-tasks \\
+                                  --region '${env.AWS_REGION}' \\
+                                  --cluster '${env.ECS_CLUSTER}' \\
+                                  --tasks '${env.ECS_TASK_ARN}' \\
+                                  --query 'tasks[0].stoppedReason' \\
+                                  --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        echo "Container exit code : ${exitCode}"
+                        echo "Task stopped reason : ${stopReason}"
+
+                        if (exitCode != '0') {
+                            error(
+                                "Katalon tests failed — " +
+                                "exitCode=${exitCode}, stoppedReason=${stopReason}, " +
+                                "taskArn=${env.ECS_TASK_ARN}"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (env.ECS_TASK_ARN?.trim()) {
+                    echo "Task ARN  : ${env.ECS_TASK_ARN}"
+                    echo "CW logs   : ${env.CW_LOG_GROUP}"
+                    echo "Log stream: ecs/${env.ECS_CONTAINER_NAME}/${env.ECS_TASK_ID}"
+                }
+            }
+            archiveArtifacts artifacts: 'ecs-overrides.json,ecs-network-config.json',
+                             allowEmptyArchive: true
+            cleanWs(deleteDirs: true, notFailBuild: true)
+        }
+    }
+}
